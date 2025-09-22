@@ -1,23 +1,17 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import uvicorn
-import os
+import os, logging
 
-from providers import fetch_data  # your AlphaVantage + yfinance provider module
-from modeling import load_model, predict_with_model  # ML helpers
+# import the providers and modeling modules (unchanged)
+from providers import fetch_data
+import modeling
 
-# ----------------------------------------------------
-# App initialization
-# ----------------------------------------------------
 app = FastAPI(title="Fingrow-Hybrid API v2.0")
 
-# --- CORS middleware ---
-origins = [
-    "https://fingrow-hybrid-v2-0.vercel.app"  # ✅ replace with your actual Vercel frontend URL
-]
-
+# CORS: use "*" temporarily or replace with your Vercel URL for production
+origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -26,123 +20,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------------------------------
-# Request/response schemas
-# ----------------------------------------------------
+logger = logging.getLogger("fingrow")
+
 class PredictRequest(BaseModel):
     symbol: str
-    interval: str
-    alpha_key: Optional[str] = None
+    interval: str  # expected '3-15d','1-3m','3-6m','1-3y'
+    indianapi_key: Optional[str] = None  # new per-request key name
 
-# ----------------------------------------------------
-# Routes
-# ----------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
 @app.post("/model/predict")
 def predict(req: PredictRequest):
-    """
-    Predicts stock price for given ticker + interval.
-    Returns current price, predicted price, implied return %, confidence,
-    momentum, fundamentals score, and beginner-friendly recommendation.
-    """
+    symbol = req.symbol.strip().upper()
+    interval = req.interval.strip()
+    ind_key = req.indianapi_key or None
+
+    NA = lambda: "NA"
+    out = {
+        "symbol": symbol,
+        "current_price": NA(),
+        "predicted_price": NA(),
+        "implied_return_pct": NA(),
+        "confidence_pct": NA(),
+        "momentum_pct": NA(),
+        "fundamentals_score": NA(),
+        "recommendation": {"action": NA(), "target_price": NA(), "explanation": NA()},
+        "provider": "NA"
+    }
+
     try:
-        # Fetch current + historical data
-        data = fetch_data(req.symbol, req.alpha_key)
-        if not data or "current_price" not in data:
-            return {
-                "symbol": req.symbol,
-                "current_price": "NA",
-                "predicted_price": "NA",
-                "implied_return_pct": "NA",
-                "confidence_pct": "NA",
-                "momentum_pct": "NA",
-                "fundamentals_score": "NA",
-                "recommendation": {
-                    "action": "NA",
-                    "target_price": "NA",
-                    "explanation": "NA"
-                },
-                "provider": "NA"
-            }
-
-        current_price = data["current_price"]
-
-        # Load correct model
-        model = load_model(req.interval)
-        if model is None:
-            return {
-                "symbol": req.symbol,
-                "current_price": current_price,
-                "predicted_price": "NA",
-                "implied_return_pct": "NA",
-                "confidence_pct": "NA",
-                "momentum_pct": data.get("momentum_pct", "NA"),
-                "fundamentals_score": data.get("fundamentals_score", "NA"),
-                "recommendation": {
-                    "action": "NA",
-                    "target_price": "NA",
-                    "explanation": "Model not trained"
-                },
-                "provider": data.get("provider", "NA")
-            }
-
-        # Run prediction
-        prediction, conf = predict_with_model(model, data)
-
-        implied_return = None
-        if prediction and current_price and prediction != "NA":
-            implied_return = round(((prediction - current_price) / current_price) * 100, 2)
-
-        # Beginner-friendly recommendation logic
-        if prediction == "NA":
-            rec = {"action": "NA", "target_price": "NA", "explanation": "Prediction unavailable"}
-        else:
-            if implied_return is not None and implied_return > 5:
-                rec = {"action": "Buy", "target_price": prediction,
-                       "explanation": "Predicted growth and positive fundamentals suggest buying."}
-            elif implied_return is not None and implied_return < -5:
-                rec = {"action": "Sell", "target_price": prediction,
-                       "explanation": "Predicted decline indicates you may want to sell."}
-            else:
-                rec = {"action": "Hold", "target_price": prediction,
-                       "explanation": "Little expected movement — best to hold for now."}
-
-        return {
-            "symbol": req.symbol,
-            "current_price": current_price,
-            "predicted_price": prediction if prediction is not None else "NA",
-            "implied_return_pct": implied_return if implied_return is not None else "NA",
-            "confidence_pct": conf if conf is not None else "NA",
-            "momentum_pct": data.get("momentum_pct", "NA"),
-            "fundamentals_score": data.get("fundamentals_score", "NA"),
-            "recommendation": rec,
-            "provider": data.get("provider", "NA")
-        }
-
+        q = fetch_data(symbol, indianapi_key=ind_key)
     except Exception as e:
-        # Fail-safe return (everything = NA)
-        return {
-            "symbol": req.symbol,
-            "current_price": "NA",
-            "predicted_price": "NA",
-            "implied_return_pct": "NA",
-            "confidence_pct": "NA",
-            "momentum_pct": "NA",
-            "fundamentals_score": "NA",
-            "recommendation": {
-                "action": "NA",
-                "target_price": "NA",
-                "explanation": f"Error: {str(e)}"
-            },
-            "provider": "NA"
-        }
+        logger.exception("fetch_data error")
+        q = None
 
-# ----------------------------------------------------
-# Run locally (optional)
-# ----------------------------------------------------
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    if not q or q.get("current_price") is None:
+        # safe NA response
+        return out
+
+    out["current_price"] = float(q.get("current_price"))
+    out["provider"] = q.get("provider") or "NA"
+    out["momentum_pct"] = q.get("momentum_pct") if q.get("momentum_pct") is not None else "NA"
+    out["fundamentals_score"] = q.get("fundamentals_score") if q.get("fundamentals_score") is not None else "NA"
+
+    # Load model for requested interval
+    try:
+        model = modeling.load_model(interval)
+        if model is None:
+            return out
+        # Prepare feature vector in modeling.predict_with_model
+        pred_price, conf = modeling.predict_with_model(model, {"current_price": out["current_price"], "history": q.get("history")})
+        out["predicted_price"] = pred_price if pred_price is not None else "NA"
+        if pred_price is not None:
+            out["implied_return_pct"] = round(((pred_price - out["current_price"]) / out["current_price"]) * 100.0, 3)
+        out["confidence_pct"] = conf if conf is not None else "NA"
+    except FileNotFoundError:
+        # model missing: return NA for prediction
+        return out
+    except Exception:
+        logger.exception("prediction error")
+        return out
+
+    # Recommendation (beginner-friendly)
+    try:
+        impl = out["implied_return_pct"]
+        rec = {"action": "NA", "target_price": "NA", "explanation": "NA"}
+        if impl != "NA":
+            implf = float(impl)
+            if implf >= 10.0:
+                rec["action"] = "Buy"
+                rec["target_price"] = out["predicted_price"]
+                rec["explanation"] = f"Predicted upside {implf:.2f}%. Suggest buying if it fits your risk profile."
+            elif implf >= 5.0:
+                rec["action"] = "Consider Buy"
+                rec["target_price"] = out["predicted_price"]
+                rec["explanation"] = f"Moderate upside {implf:.2f}%. You may accumulate gradually and monitor fundamentals."
+            elif implf >= -5.0:
+                rec["action"] = "Hold"
+                rec["target_price"] = out["predicted_price"]
+                rec["explanation"] = f"Predicted change {implf:.2f}%. Best to hold and re-evaluate; consider stop-loss if downside risk matters."
+            else:
+                rec["action"] = "Sell"
+                rec["target_price"] = out["predicted_price"]
+                rec["explanation"] = f"Predicted downside {implf:.2f}%. Consider selling to limit losses or set a tight stop-loss."
+        out["recommendation"] = rec
+    except Exception:
+        pass
+
+    return out

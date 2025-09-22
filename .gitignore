@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.alpha_last_call
+models/
+node_modules/
+dist/
+.DS_Store

@@ -1,24 +1,15 @@
 """
 providers.py
 
-Alpha Vantage + yfinance adapter with:
-- simple rate limiting for Alpha Vantage
-- fallback to yfinance
-- auto-try common Indian suffixes (.NS, .BO) when user provides ticker without suffix
-- returns a consistent dict used by main.py
+Primary: IndianAPI
+Fallback: yfinance
 
-Returns:
-- dict with keys:
-    - symbol (requested symbol uppercase)
-    - resolved_symbol (symbol actually used to fetch, e.g. 'RELIANCE.NS')
-    - current_price (float)
-    - provider (str: 'alphavantage' or 'yfinance')
-    - timestamp (str or None)
-    - raw (raw provider response or None)
-    - history (optional dict/time-series or None)
-    - momentum_pct (float or None)
-    - fundamentals_score (int 0-100 or None)
-- OR None if all providers failed (so main will return NA)
+Exposes:
+    fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> dict|None
+
+Returns dict with keys:
+    symbol, resolved_symbol, current_price, provider, timestamp, raw, history, momentum_pct, fundamentals_score
+or None (so main.py returns NA).
 """
 
 import os
@@ -31,10 +22,13 @@ try:
 except Exception:
     yf = None
 
-ALPHA_BASE = os.getenv("ALPHAVANTAGE_BASE", "https://www.alphavantage.co/query")
-ALPHA_KEY = os.getenv("ALPHAVANTAGE_KEY", "") or None
-ALPHA_CALLS_PER_MIN = int(os.getenv("ALPHAVANTAGE_CALLS_PER_MIN", "5"))
-_LAST_CALL_FILE = ".alpha_last_call"
+# IndianAPI defaults & env var name
+INDIANAPI_BASE = os.getenv("INDIANAPI_BASE", "https://stock.indianapi.in")
+INDIANAPI_KEY = os.getenv("INDIANAPI_KEY") or os.getenv("ISE_API_KEY") or None
+
+# Rate-limiter config (small file-based limiter to avoid bursts)
+RATE_LIMIT_CALLS_PER_MIN = int(os.getenv("RATE_LIMIT_CALLS_PER_MIN", "5"))
+_LAST_CALL_FILE = ".indianapi_last_call"
 
 # Suffixes to try for plain tickers (helps Indian tickers)
 SUFFIX_TRIALS = ["", ".NS", ".BO"]
@@ -48,13 +42,7 @@ def _safe_float(v):
 
 
 def _respect_rate_limit():
-    """
-    Very small file-based limiter to respect ALPHAVANTAGE_CALLS_PER_MIN across processes on the same disk.
-    Not perfect for multi-server, but helps avoid quick bursts in single-instance deployments.
-    """
-    if not ALPHA_KEY:
-        return
-    interval = 60.0 / max(1, ALPHA_CALLS_PER_MIN)
+    interval = 60.0 / max(1, RATE_LIMIT_CALLS_PER_MIN)
     try:
         ts = 0.0
         if os.path.exists(_LAST_CALL_FILE):
@@ -74,33 +62,46 @@ def _respect_rate_limit():
             pass
 
 
-def _alpha_fetch(symbol: str, alpha_key: Optional[str] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
+def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
     """
-    Fetch price using Alpha Vantage GLOBAL_QUOTE.
-    Returns dict similar to yfinance wrapper or None on failure/rate-limit.
+    Fetch using IndianAPI. Tries header x-api-key and query param 'api_key'.
     """
-    key = alpha_key or ALPHA_KEY
+    key = api_key or INDIANAPI_KEY
     if not key:
         return None
 
     _respect_rate_limit()
-    params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key}
+    base = INDIANAPI_BASE.rstrip("/")
+    url = f"{base}/stock"
+    params = {"name": symbol}
+    headers = {"x-api-key": key}
     try:
-        resp = requests.get(ALPHA_BASE, params=params, timeout=timeout)
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
         if resp.status_code != 200:
-            return None
+            params["api_key"] = key
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code != 200:
+                return None
         j = resp.json()
-        # handle rate limit / error
-        if isinstance(j, dict) and ("Note" in j or "Error Message" in j):
-            return None
-        g = j.get("Global Quote") or {}
-        # Keys sometimes have spaces or different formats
-        price = _safe_float(g.get("05. price") or g.get("05 price") or g.get("price"))
-        ts = g.get("07. latest trading day") or g.get("07 latest trading day") or None
+        # prefer NSE -> BSE -> generic price keys
+        price = None
+        ts = None
+        if isinstance(j, dict) and "currentPrice" in j:
+            cp = j.get("currentPrice") or {}
+            price = _safe_float(cp.get("NSE") or cp.get("BSE") or cp.get("price"))
+            ts = j.get("timestamp") or j.get("updatedAt")
+        else:
+            if isinstance(j, dict):
+                price = _safe_float(j.get("price") or j.get("current_price") or j.get("close") or j.get("lastPrice"))
+                ts = j.get("timestamp")
+            elif isinstance(j, list) and len(j) > 0 and isinstance(j[0], dict):
+                first = j[0]
+                price = _safe_float(first.get("price") or first.get("close"))
+                ts = first.get("timestamp") or first.get("date")
         return {
             "resolved_symbol": symbol,
             "current_price": price,
-            "provider": "alphavantage",
+            "provider": "indianapi",
             "timestamp": ts,
             "raw": j,
             "history": None,
@@ -110,16 +111,11 @@ def _alpha_fetch(symbol: str, alpha_key: Optional[str] = None, timeout: int = 10
 
 
 def _yfinance_fetch(symbol: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
-    """
-    Fetch using yfinance. Returns dict or None on failure.
-    """
     if yf is None:
         return None
     try:
         t = yf.Ticker(symbol)
-        # try 1y history to allow momentum calc
         hist = t.history(period="1y")
-        # If history empty, still try fast_info
         if hist is None or hist.empty:
             fast = getattr(t, "fast_info", None)
             price = None
@@ -141,22 +137,17 @@ def _yfinance_fetch(symbol: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
             "current_price": price,
             "provider": "yfinance",
             "timestamp": ts,
-            "raw": hist.tail(5).to_dict(),  # small raw footprint
+            "raw": hist.tail(5).to_dict(),
             "history": hist.to_dict(),
         }
     except Exception:
         return None
 
 
-def _compute_momentum_from_history(history_dict: Dict[str, Any]) -> Optional[float]:
-    """
-    Compute simple momentum % using earliest vs latest close values in history dict.
-    Expects history dict in the form produced by pandas.DataFrame.to_dict() for yfinance.
-    """
+def _compute_momentum_from_history(history_dict):
     try:
-        if history_dict is None:
+        if not history_dict:
             return None
-        # history_dict example: {'Open': {ts: val, ...}, 'Close': {...}, ...}
         if "Close" in history_dict:
             closes = list(history_dict["Close"].values())
             if len(closes) >= 2:
@@ -169,11 +160,7 @@ def _compute_momentum_from_history(history_dict: Dict[str, Any]) -> Optional[flo
     return None
 
 
-def _compute_fundamentals_score_from_yf(symbol: str) -> Optional[int]:
-    """
-    Pull basic fundamentals via yfinance and calculate a heuristic score 0-100.
-    Uses trailing PE, price-to-book, dividend yield where available.
-    """
+def _compute_fundamentals_score_from_yf(symbol: str):
     if yf is None:
         return None
     try:
@@ -184,15 +171,13 @@ def _compute_fundamentals_score_from_yf(symbol: str) -> Optional[int]:
         div = info.get("dividendYield") or info.get("dividend_yield") or None
         scores = []
         if pe and pe > 0:
-            # ideal PE ~15
             s = max(0.0, min(1.0, 1.0 / (pe / 15.0)))
             scores.append(s)
         if pb and pb > 0:
-            # ideal PB <=2
             s = max(0.0, min(1.0, 1.0 - ((pb - 2.0) / 10.0)))
             scores.append(s)
         if div and div > 0:
-            s = max(0.0, min(1.0, div * 5.0))  # scaled
+            s = max(0.0, min(1.0, div * 5.0))
             scores.append(s)
         if not scores:
             return None
@@ -202,32 +187,18 @@ def _compute_fundamentals_score_from_yf(symbol: str) -> Optional[int]:
         return None
 
 
-def fetch_data(user_symbol: str, alpha_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Public entry point used by main.py.
-
-    - user_symbol: ticker entered by user (no suffix expected)
-    - alpha_key: optional per-request Alpha Vantage API key (overrides env key)
-    Returns structured dict or None if all attempts failed.
+    Public entry: fetch_data(user_symbol, indianapi_key=None)
+    If indianapi_key provided, it will be used for IndianAPI calls; otherwise INDIANAPI_KEY env var is used.
     """
     if not user_symbol or not str(user_symbol).strip():
         return None
-
     user_symbol = str(user_symbol).strip().upper()
-
-    # If user already included a suffix (contains '.' or ':'), only try that exact symbol
     has_suffix = ("." in user_symbol) or (":" in user_symbol)
-
-    # Try providers and suffix trials in order:
-    # 1) Alpha Vantage (exact symbol or with trials)
-    # 2) yfinance (exact symbol or with trials)
-    # On first successful fetch that contains a price (not None), we proceed to enrich and return.
-
     tried_symbols = []
 
     def _try_symbol_variants(fetcher):
-        # fetcher is function that accepts resolved_symbol and returns dict or None
-        # iterate SUFFIX_TRIALS but if user already had suffix, only try exact once
         to_try = [user_symbol] if has_suffix else [user_symbol + s for s in SUFFIX_TRIALS]
         for sym in to_try:
             if sym in tried_symbols:
@@ -235,48 +206,39 @@ def fetch_data(user_symbol: str, alpha_key: Optional[str] = None) -> Optional[Di
             tried_symbols.append(sym)
             res = fetcher(sym)
             if res and res.get("current_price") is not None:
-                # successful fetch
-                res["symbol"] = user_symbol  # keep original user-provided symbol normalized
+                res["symbol"] = user_symbol
                 return res
         return None
 
-    # 1) Try Alpha Vantage first (if key available)
-    alpha_res = None
-    if ALPHA_KEY or alpha_key:
-        try:
-            alpha_res = _try_symbol_variants(lambda s: _alpha_fetch(s, alpha_key=alpha_key))
-        except Exception:
-            alpha_res = None
+    # 1) Try IndianAPI first
+    indian_res = None
+    try:
+        indian_res = _try_symbol_variants(lambda s: _indianapi_fetch(s, api_key=indianapi_key))
+    except Exception:
+        indian_res = None
 
-    # 2) If Alpha Vantage failed, try yfinance
+    # 2) Fallback to yfinance
     yf_res = None
-    if alpha_res is None:
+    if indian_res is None:
         try:
             yf_res = _try_symbol_variants(lambda s: _yfinance_fetch(s))
         except Exception:
             yf_res = None
 
-    chosen = alpha_res or yf_res
+    chosen = indian_res or yf_res
     if not chosen or chosen.get("current_price") is None:
-        # all providers failed -> return None so main will output NA
         return None
 
-    # Enrich: momentum and fundamentals (prefer yfinance history/info)
+    history = chosen.get("history", None)
     momentum = None
     fundamentals_score = None
-    history = chosen.get("history", None)
     resolved_symbol = chosen.get("resolved_symbol", None)
-
-    # momentum from available history
     try:
         if history:
             momentum = _compute_momentum_from_history(history)
     except Exception:
         momentum = None
-
-    # fundamentals from yfinance resolved_symbol (best effort)
     try:
-        # prefer using resolved_symbol (e.g. RELIANCE.NS) for fundamentals lookup
         if yf is not None and resolved_symbol:
             fundamentals_score = _compute_fundamentals_score_from_yf(resolved_symbol)
     except Exception:
@@ -293,5 +255,4 @@ def fetch_data(user_symbol: str, alpha_key: Optional[str] = None) -> Optional[Di
         "momentum_pct": momentum,
         "fundamentals_score": fundamentals_score,
     }
-
     return result

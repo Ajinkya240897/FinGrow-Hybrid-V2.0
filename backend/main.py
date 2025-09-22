@@ -1,17 +1,18 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import os, logging
 
-# import the providers and modeling modules (unchanged)
+# import providers and modeling
 from providers import fetch_data
 import modeling
 
 app = FastAPI(title="Fingrow-Hybrid API v2.0")
 
-# CORS: use "*" temporarily or replace with your Vercel URL for production
+# Allow all origins for now; replace "*" with your Vercel URL for production
 origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -22,14 +23,24 @@ app.add_middleware(
 
 logger = logging.getLogger("fingrow")
 
-class PredictRequest(BaseModel):
-    symbol: str
-    interval: str  # expected '3-15d','1-3m','3-6m','1-3y'
-    indianapi_key: Optional[str] = None  # new per-request key name
+# ---------------- Root & health ----------------
+@app.get("/")
+def root():
+    return {
+        "service": "Fingrow-Hybrid backend",
+        "version": "v2.0",
+        "status": "ok"
+    }
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# ---------------- Prediction request ----------------
+class PredictRequest(BaseModel):
+    symbol: str
+    interval: str  # '3-15d','1-3m','3-6m','1-3y'
+    indianapi_key: Optional[str] = None  # new key name
 
 @app.post("/model/predict")
 def predict(req: PredictRequest):
@@ -37,6 +48,7 @@ def predict(req: PredictRequest):
     interval = req.interval.strip()
     ind_key = req.indianapi_key or None
 
+    # default NA response
     NA = lambda: "NA"
     out = {
         "symbol": symbol,
@@ -46,10 +58,15 @@ def predict(req: PredictRequest):
         "confidence_pct": NA(),
         "momentum_pct": NA(),
         "fundamentals_score": NA(),
-        "recommendation": {"action": NA(), "target_price": NA(), "explanation": NA()},
+        "recommendation": {
+            "action": NA(),
+            "target_price": NA(),
+            "explanation": NA()
+        },
         "provider": "NA"
     }
 
+    # Step 1: Fetch data
     try:
         q = fetch_data(symbol, indianapi_key=ind_key)
     except Exception as e:
@@ -57,7 +74,6 @@ def predict(req: PredictRequest):
         q = None
 
     if not q or q.get("current_price") is None:
-        # safe NA response
         return out
 
     out["current_price"] = float(q.get("current_price"))
@@ -65,25 +81,31 @@ def predict(req: PredictRequest):
     out["momentum_pct"] = q.get("momentum_pct") if q.get("momentum_pct") is not None else "NA"
     out["fundamentals_score"] = q.get("fundamentals_score") if q.get("fundamentals_score") is not None else "NA"
 
-    # Load model for requested interval
+    # Step 2: Prediction
     try:
         model = modeling.load_model(interval)
         if model is None:
             return out
-        # Prepare feature vector in modeling.predict_with_model
-        pred_price, conf = modeling.predict_with_model(model, {"current_price": out["current_price"], "history": q.get("history")})
+
+        pred_price, conf = modeling.predict_with_model(
+            model,
+            {"current_price": out["current_price"], "history": q.get("history")}
+        )
+
         out["predicted_price"] = pred_price if pred_price is not None else "NA"
         if pred_price is not None:
-            out["implied_return_pct"] = round(((pred_price - out["current_price"]) / out["current_price"]) * 100.0, 3)
+            out["implied_return_pct"] = round(
+                ((pred_price - out["current_price"]) / out["current_price"]) * 100.0,
+                3
+            )
         out["confidence_pct"] = conf if conf is not None else "NA"
     except FileNotFoundError:
-        # model missing: return NA for prediction
         return out
     except Exception:
         logger.exception("prediction error")
         return out
 
-    # Recommendation (beginner-friendly)
+    # Step 3: Recommendation
     try:
         impl = out["implied_return_pct"]
         rec = {"action": "NA", "target_price": "NA", "explanation": "NA"}

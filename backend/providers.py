@@ -1,20 +1,12 @@
+# backend/providers.py
 """
-providers.py
-
-Primary: IndianAPI
-Fallback: yfinance
-
-Exposes:
-    fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> dict|None
-
-Returns dict with keys:
-    symbol, resolved_symbol, current_price, provider, timestamp, raw, history, momentum_pct, fundamentals_score
-or None (so main.py returns NA).
+Fetch market data using IndianAPI (primary) and yfinance (fallback).
+Provides fetch_data(symbol, indianapi_key=None) -> dict or None
+Returned dict includes:
+  - symbol, resolved_symbol, current_price, provider, timestamp, raw, history, momentum_pct, fundamentals_score
 """
 
-import os
-import time
-import requests
+import os, time, requests
 from typing import Optional, Dict, Any
 
 try:
@@ -22,24 +14,18 @@ try:
 except Exception:
     yf = None
 
-# IndianAPI defaults & env var name
 INDIANAPI_BASE = os.getenv("INDIANAPI_BASE", "https://stock.indianapi.in")
-INDIANAPI_KEY = os.getenv("INDIANAPI_KEY") or os.getenv("ISE_API_KEY") or None
-
-# Rate-limiter config (small file-based limiter to avoid bursts)
+INDIANAPI_KEY = os.getenv("INDIANAPI_KEY", None)
 RATE_LIMIT_CALLS_PER_MIN = int(os.getenv("RATE_LIMIT_CALLS_PER_MIN", "5"))
 _LAST_CALL_FILE = ".indianapi_last_call"
 
-# Suffixes to try for plain tickers (helps Indian tickers)
 SUFFIX_TRIALS = ["", ".NS", ".BO"]
-
 
 def _safe_float(v):
     try:
         return float(v)
     except Exception:
         return None
-
 
 def _respect_rate_limit():
     interval = 60.0 / max(1, RATE_LIMIT_CALLS_PER_MIN)
@@ -61,15 +47,10 @@ def _respect_rate_limit():
         except Exception:
             pass
 
-
 def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
-    """
-    Fetch using IndianAPI. Tries header x-api-key and query param 'api_key'.
-    """
     key = api_key or INDIANAPI_KEY
     if not key:
         return None
-
     _respect_rate_limit()
     base = INDIANAPI_BASE.rstrip("/")
     url = f"{base}/stock"
@@ -83,7 +64,6 @@ def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 
             if resp.status_code != 200:
                 return None
         j = resp.json()
-        # prefer NSE -> BSE -> generic price keys
         price = None
         ts = None
         if isinstance(j, dict) and "currentPrice" in j:
@@ -94,28 +74,23 @@ def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 
             if isinstance(j, dict):
                 price = _safe_float(j.get("price") or j.get("current_price") or j.get("close") or j.get("lastPrice"))
                 ts = j.get("timestamp")
-            elif isinstance(j, list) and len(j) > 0 and isinstance(j[0], dict):
-                first = j[0]
-                price = _safe_float(first.get("price") or first.get("close"))
-                ts = first.get("timestamp") or first.get("date")
         return {
             "resolved_symbol": symbol,
             "current_price": price,
             "provider": "indianapi",
             "timestamp": ts,
             "raw": j,
-            "history": None,
+            "history": None
         }
     except Exception:
         return None
-
 
 def _yfinance_fetch(symbol: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
     if yf is None:
         return None
     try:
         t = yf.Ticker(symbol)
-        hist = t.history(period="1y")
+        hist = t.history(period="2y")  # fetch 2 years by default
         if hist is None or hist.empty:
             fast = getattr(t, "fast_info", None)
             price = None
@@ -127,7 +102,7 @@ def _yfinance_fetch(symbol: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
                 "provider": "yfinance",
                 "timestamp": None,
                 "raw": fast,
-                "history": hist.to_dict() if hist is not None else None,
+                "history": hist.to_dict() if hist is not None else None
             }
         last_row = hist.iloc[-1]
         price = _safe_float(last_row.get("Close"))
@@ -138,11 +113,10 @@ def _yfinance_fetch(symbol: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
             "provider": "yfinance",
             "timestamp": ts,
             "raw": hist.tail(5).to_dict(),
-            "history": hist.to_dict(),
+            "history": hist.tail(100).to_dict()
         }
     except Exception:
         return None
-
 
 def _compute_momentum_from_history(history_dict):
     try:
@@ -158,7 +132,6 @@ def _compute_momentum_from_history(history_dict):
     except Exception:
         pass
     return None
-
 
 def _compute_fundamentals_score_from_yf(symbol: str):
     if yf is None:
@@ -186,12 +159,7 @@ def _compute_fundamentals_score_from_yf(symbol: str):
     except Exception:
         return None
 
-
 def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Public entry: fetch_data(user_symbol, indianapi_key=None)
-    If indianapi_key provided, it will be used for IndianAPI calls; otherwise INDIANAPI_KEY env var is used.
-    """
     if not user_symbol or not str(user_symbol).strip():
         return None
     user_symbol = str(user_symbol).strip().upper()
@@ -210,14 +178,14 @@ def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optiona
                 return res
         return None
 
-    # 1) Try IndianAPI first
+    # Try IndianAPI first
     indian_res = None
     try:
         indian_res = _try_symbol_variants(lambda s: _indianapi_fetch(s, api_key=indianapi_key))
     except Exception:
         indian_res = None
 
-    # 2) Fallback to yfinance
+    # Fallback to yfinance
     yf_res = None
     if indian_res is None:
         try:

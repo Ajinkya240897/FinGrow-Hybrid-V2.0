@@ -1,12 +1,9 @@
 fastapi
-uvicorn[standard]
+uvicorn
 requests
-python-dotenv
-pydantic
-scikit-learn
-joblib
 pandas
 numpy
+scikit-learn
+joblib
 yfinance
-python-multipart
-pytest
+python-dateutil

@@ -1,17 +1,14 @@
 # backend/main.py
+import traceback, json
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import os, logging, json
 
-# import providers and modeling
-from providers import fetch_data
+import providers
 import modeling
 
-app = FastAPI(title="Fingrow-Hybrid API v2.0")
+app = FastAPI(title="Fingrow-Hybrid V2.0")
 
-# Allow all origins for now; replace "*" with your Vercel URL for production
+# In production restrict origins to your frontend site for security
 origins = ["*"]
 
 app.add_middleware(
@@ -22,131 +19,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logger = logging.getLogger("fingrow")
-
-
-# ---------------- Root & health ----------------
 @app.get("/")
 def root():
-    return {
-        "service": "Fingrow-Hybrid backend",
-        "version": "v2.0",
-        "status": "ok"
-    }
+    return {"service": "Fingrow-Hybrid backend", "version": "v2.0", "status": "ok"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
-# ---------------- Prediction request ----------------
-# Keep Pydantic model for docs, but we'll parse the raw body ourselves to be tolerant.
-class PredictRequest(BaseModel):
-    symbol: str
-    interval: str  # '3-15d','1-3m','3-6m','1-3y'
-    indianapi_key: Optional[str] = None  # new key name
-
-
-async def _parse_json_tolerant(request: Request):
-    """
-    Read request body and attempt to parse JSON.
-    - First, try standard json.loads
-    - If that fails with JSONDecodeError ("Extra data"), attempt to raw_decode the first JSON object
-      and return that object (ignoring trailing garbage).
-    Returns parsed dict on success or raises HTTPException(400) on failure.
-    """
-    body_bytes = await request.body()
-    if not body_bytes:
-        raise HTTPException(status_code=400, detail="Empty request body")
-    text = None
-    try:
-        text = body_bytes.decode('utf-8')
-    except Exception:
-        # fallback: try latin-1 decode
-        try:
-            text = body_bytes.decode('latin-1')
-        except Exception:
-            raise HTTPException(status_code=400, detail="Could not decode request body as text")
-
-    # Try normal parse
-    try:
-        parsed = json.loads(text)
-        if not isinstance(parsed, dict):
-            # if parsed is not an object, reject
-            raise HTTPException(status_code=400, detail="Expected JSON object in request body")
-        return parsed
-    except json.JSONDecodeError as e:
-        # Attempt tolerant parse: extract first JSON object using JSONDecoder.raw_decode
-        try:
-            decoder = json.JSONDecoder()
-            obj, idx = decoder.raw_decode(text)
-            if isinstance(obj, dict):
-                return obj
-            else:
-                raise HTTPException(status_code=400, detail="First JSON value is not an object")
-        except Exception as e2:
-            # Could not recover
-            logger.exception("JSON parse failed", exc_info=True)
-            raise HTTPException(status_code=400, detail=f"JSON decode error: {str(e)}")
-
-
 @app.post("/model/predict")
 async def predict(request: Request):
     """
-    Tolerant predict endpoint: parses JSON tolerantly and then proceeds with normal flow.
-    Returns safe 'NA' fields on any failure.
+    Accepts JSON:
+    { "symbol": "RELIANCE", "interval": "3-15d", "indianapi_key": "<optional-key>" }
+
+    Returns:
+      - current_price
+      - predicted_price
+      - implied_return_pct
+      - confidence_pct
+      - momentum_pct
+      - fundamentals_score
+      - recommendation (action, target_price, explanation)
     """
-    # default NA response
+    # safe NA helper
     NA = lambda: "NA"
     out = {
         "symbol": NA(),
+        "interval": NA(),
         "current_price": NA(),
         "predicted_price": NA(),
         "implied_return_pct": NA(),
         "confidence_pct": NA(),
         "momentum_pct": NA(),
         "fundamentals_score": NA(),
-        "recommendation": {
-            "action": NA(),
-            "target_price": NA(),
-            "explanation": NA()
-        },
+        "recommendation": {"action": NA(), "target_price": NA(), "explanation": NA()},
         "provider": "NA"
     }
 
-    # Parse JSON tolerantly
+    # tolerant parse — get JSON body
     try:
-        payload = await _parse_json_tolerant(request)
-    except HTTPException as he:
-        # return FastAPI JSON error for client; frontend should show a friendly message
-        raise he
-    except Exception as e:
-        logger.exception("Unexpected parse error")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # Validate expected fields
-    symbol = payload.get("symbol", "")
-    interval = payload.get("interval", "")
-    ind_key = payload.get("indianapi_key", None)
-
-    if not symbol or not interval:
-        # Return 400: missing fields
-        raise HTTPException(status_code=400, detail="Missing required fields 'symbol' and/or 'interval'")
-
-    symbol = str(symbol).strip().upper()
-    interval = str(interval).strip()
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    interval = str(payload.get("interval", "")).strip()
+    indianapi_key = payload.get("indianapi_key", None)
 
     out["symbol"] = symbol
+    out["interval"] = interval
 
-    # Step 1: Fetch data
+    if not symbol or not interval:
+        raise HTTPException(status_code=400, detail="Missing 'symbol' or 'interval'")
+
+    # Step 1: fetch data (IndianAPI primary, yfinance fallback)
     try:
-        q = fetch_data(symbol, indianapi_key=ind_key)
+        q = providers.fetch_data(symbol, indianapi_key=indianapi_key)
     except Exception:
-        logger.exception("fetch_data error")
         q = None
 
     if not q or q.get("current_price") is None:
-        # safe NA response
+        # safe NA output when no live price
         return out
 
     out["current_price"] = float(q.get("current_price"))
@@ -154,34 +88,33 @@ async def predict(request: Request):
     out["momentum_pct"] = q.get("momentum_pct") if q.get("momentum_pct") is not None else "NA"
     out["fundamentals_score"] = q.get("fundamentals_score") if q.get("fundamentals_score") is not None else "NA"
 
-    # Step 2: Prediction
+    # Step 2: load or train model on-demand & predict
     try:
-        model = modeling.load_model(interval)
+        resolved = q.get("resolved_symbol") or symbol
+        model = modeling.load_or_train_model(resolved, interval, history_dict=q.get("history"))
         if model is None:
             return out
 
-        pred_price, conf = modeling.predict_with_model(
-            model,
-            {"current_price": out["current_price"], "history": q.get("history")}
-        )
+        pred_price, conf = modeling.predict_with_model(model, {
+            "current_price": out["current_price"],
+            "history": q.get("history")
+        })
 
-        out["predicted_price"] = pred_price if pred_price is not None else "NA"
-        if pred_price is not None:
-            try:
-                out["implied_return_pct"] = round(
-                    ((pred_price - out["current_price"]) / out["current_price"]) * 100.0,
-                    3
-                )
-            except Exception:
-                out["implied_return_pct"] = "NA"
-        out["confidence_pct"] = conf if conf is not None else "NA"
-    except FileNotFoundError:
-        return out
+        if pred_price is None:
+            return out
+
+        out["predicted_price"] = round(pred_price, 2)
+        try:
+            out["implied_return_pct"] = round(100.0 * (out["predicted_price"] - out["current_price"]) / out["current_price"], 3)
+        except Exception:
+            out["implied_return_pct"] = "NA"
+        out["confidence_pct"] = round(conf, 2) if conf is not None else "NA"
+
     except Exception:
-        logger.exception("prediction error")
+        traceback.print_exc()
         return out
 
-    # Step 3: Recommendation
+    # Step 3: beginner-friendly recommendation
     try:
         impl = out["implied_return_pct"]
         rec = {"action": "NA", "target_price": "NA", "explanation": "NA"}

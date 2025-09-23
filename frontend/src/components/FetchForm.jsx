@@ -1,4 +1,5 @@
-import React, {useState, useRef} from 'react'
+// frontend/src/components/FetchForm.jsx
+import React, {useState} from 'react'
 import {predict} from '../api'
 
 export default function FetchForm({onResult}){
@@ -7,7 +8,6 @@ export default function FetchForm({onResult}){
   const [indianKey,setIndianKey]=useState('')
   const [loading,setLoading]=useState(false)
   const [error,setError]=useState(null)
-  const abortRef = useRef(null)
 
   const submit = async (e) => {
     e.preventDefault()

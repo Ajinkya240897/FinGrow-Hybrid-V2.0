@@ -1,6 +1,8 @@
-import React, {useState} from 'react'
+// frontend/src/App.jsx
+import React, { useState } from 'react'
 import FetchForm from './components/FetchForm'
 import Result from './components/Result'
+import './styles.css'
 
 export default function App(){
   const [result,setResult] = useState(null)

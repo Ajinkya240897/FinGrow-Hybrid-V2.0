@@ -1,12 +1,22 @@
 # backend/providers.py
 """
-Fetch market data using IndianAPI (primary) and yfinance (fallback).
-Provides fetch_data(symbol, indianapi_key=None) -> dict or None
-Returned dict includes:
-  - symbol, resolved_symbol, current_price, provider, timestamp, raw, history, momentum_pct, fundamentals_score
+Providers: IndianAPI (primary for current price) + yfinance fallback/supplement for history.
+
+Returns dict with:
+  - symbol (user requested)
+  - resolved_symbol (actual symbol used for provider calls)
+  - current_price (float) or None
+  - provider (string: 'indianapi' or 'yfinance')
+  - timestamp
+  - raw (provider raw payload)
+  - history (dict with keys "Open","High","Low","Close","Volume" -> {date_str: value})
+  - momentum_pct (float or None)
+  - fundamentals_score (int 0-100 or None)
 """
 
-import os, time, requests
+import os
+import time
+import requests
 from typing import Optional, Dict, Any
 
 try:
@@ -21,12 +31,14 @@ _LAST_CALL_FILE = ".indianapi_last_call"
 
 SUFFIX_TRIALS = ["", ".NS", ".BO"]
 
+# helper: safe float
 def _safe_float(v):
     try:
         return float(v)
     except Exception:
         return None
 
+# simple rate-limit for indianapi (not perfect but prevents bursts)
 def _respect_rate_limit():
     interval = 60.0 / max(1, RATE_LIMIT_CALLS_PER_MIN)
     try:
@@ -47,7 +59,11 @@ def _respect_rate_limit():
         except Exception:
             pass
 
-def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
+def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    """
+    Try to call IndianAPI for a stock symbol's current price.
+    Note: IndianAPI sometimes returns only price/no history. We treat it as price provider.
+    """
     key = api_key or INDIANAPI_KEY
     if not key:
         return None
@@ -59,97 +75,181 @@ def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=timeout)
         if resp.status_code != 200:
+            # try passing api_key as param (some instances)
             params["api_key"] = key
             resp = requests.get(url, params=params, timeout=timeout)
             if resp.status_code != 200:
                 return None
         j = resp.json()
+        # IndianAPI returns nested structure; try to get price from known locations
         price = None
         ts = None
-        if isinstance(j, dict) and "currentPrice" in j:
-            cp = j.get("currentPrice") or {}
-            price = _safe_float(cp.get("NSE") or cp.get("BSE") or cp.get("price"))
+        raw = j
+        # examples: j.get('currentPrice') or j.get('price')
+        if isinstance(j, dict):
+            # try multiple possible fields
+            cp = j.get("currentPrice") or j.get("price") or j.get("data") or None
+            if isinstance(cp, dict):
+                # try NSE/BSE keys
+                price = _safe_float(cp.get("NSE") or cp.get("BSE") or cp.get("price"))
+            else:
+                # direct price
+                price = _safe_float(j.get("current_price") or j.get("price") or j.get("lastPrice"))
             ts = j.get("timestamp") or j.get("updatedAt")
-        else:
-            if isinstance(j, dict):
-                price = _safe_float(j.get("price") or j.get("current_price") or j.get("close") or j.get("lastPrice"))
-                ts = j.get("timestamp")
         return {
             "resolved_symbol": symbol,
             "current_price": price,
             "provider": "indianapi",
             "timestamp": ts,
-            "raw": j,
-            "history": None
+            "raw": raw,
+            "history": None  # indianapi typically doesn't provide full OHLCV in a stable dict form
         }
     except Exception:
         return None
 
-def _yfinance_fetch(symbol: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+def _convert_hist_df_to_dict(hist_df):
+    """
+    Convert a pandas DataFrame (from yfinance.history) to a dict with keys
+    "Open","High","Low","Close","Volume" -> {date_str: value}
+    Date strings use YYYY-MM-DD (or ISO) formatting.
+    """
+    try:
+        d = {}
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in hist_df.columns:
+                series = hist_df[col]
+                col_map = {}
+                for idx, val in series.iteritems():
+                    try:
+                        # idx may be Timestamp -> convert to date string
+                        k = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+                    except Exception:
+                        k = str(idx)
+                    col_map[k] = float(val) if val is not None and (not (isinstance(val, float) and (val != val))) else None
+                d[col] = col_map
+        return d if d else None
+    except Exception:
+        return None
+
+def _yfinance_fetch(symbol: str, period: str = "2y", max_rows: int = 2000) -> Optional[Dict[str, Any]]:
+    """
+    Use yfinance to fetch recent history and current price info.
+    Returns dict with provider='yfinance', current_price, history as dict (Open/High/Low/Close/Volume).
+    """
     if yf is None:
         return None
     try:
         t = yf.Ticker(symbol)
-        hist = t.history(period="2y")  # fetch 2 years by default
+        # try to fetch history
+        hist = t.history(period=period, auto_adjust=False)
         if hist is None or hist.empty:
+            # try to get fast_info price fallback
             fast = getattr(t, "fast_info", None)
             price = None
-            if isinstance(fast, dict) and "lastPrice" in fast:
-                price = _safe_float(fast.get("lastPrice"))
+            if isinstance(fast, dict):
+                # fast_info may have last_price variants
+                price = _safe_float(fast.get("lastPrice") or fast.get("last_price") or fast.get("last_close"))
             return {
                 "resolved_symbol": symbol,
                 "current_price": price,
                 "provider": "yfinance",
                 "timestamp": None,
                 "raw": fast,
-                "history": hist.to_dict() if hist is not None else None
+                "history": None
             }
-        last_row = hist.iloc[-1]
-        price = _safe_float(last_row.get("Close"))
-        ts = str(last_row.name) if hasattr(last_row, "name") else None
+        # trim rows
+        if hist.shape[0] > max_rows:
+            hist = hist.tail(max_rows)
+        # convert to dict with proper column capitalization
+        # hist columns might already be like 'Open','High','Close' etc.
+        hist = hist.reset_index()
+        # if index was date, sometimes date becomes a column name; but t.history returns DateTimeIndex typically
+        # Rebuild standard DataFrame with needed columns
+        # Ensure columns names capitalization
+        colmap = {}
+        for c in hist.columns:
+            colmap[c] = c
+        # restore typical columns if present
+        # best-effort: rename lower-case to title-case
+        hist.columns = [c if c in ["Open","High","Low","Close","Volume","Date"] else (c.title() if isinstance(c, str) else c) for c in hist.columns]
+        # if date is a column create an index for consistent keys
+        if "Date" in hist.columns:
+            hist = hist.set_index("Date")
+        # Convert numeric columns to standard names
+        for want in ["Open","High","Low","Close","Volume"]:
+            if want not in hist.columns:
+                # try lower-case
+                if want.lower() in hist.columns:
+                    hist[want] = hist[want.lower()]
+        # Now convert dataframe to dict
+        hist_dict = _convert_hist_df_to_dict(hist)
+        # current price: last close if available
+        cp = None
+        try:
+            last_row = hist.tail(1)
+            if "Close" in last_row.columns:
+                cp_val = list(last_row["Close"].values)[0]
+                cp = _safe_float(cp_val)
+        except Exception:
+            cp = None
         return {
             "resolved_symbol": symbol,
-            "current_price": price,
+            "current_price": cp,
             "provider": "yfinance",
-            "timestamp": ts,
-            "raw": hist.tail(5).to_dict(),
-            "history": hist.tail(100).to_dict()
+            "timestamp": None,
+            "raw": None,
+            "history": hist_dict
         }
     except Exception:
         return None
 
 def _compute_momentum_from_history(history_dict):
+    """
+    Compute simple momentum percent from history's Close series (first->last).
+    """
     try:
-        if not history_dict:
+        if not history_dict or "Close" not in history_dict:
             return None
-        if "Close" in history_dict:
-            closes = list(history_dict["Close"].values())
-            if len(closes) >= 2:
-                first = closes[0]
-                last = closes[-1]
-                if first and first != 0:
-                    return round((last - first) / first * 100.0, 3)
+        closes_map = history_dict["Close"]
+        if not closes_map:
+            return None
+        # closes_map is date_str -> value; preserve order by sorting keys
+        items = sorted(closes_map.items(), key=lambda kv: kv[0])
+        if len(items) < 2:
+            return None
+        first = items[0][1]
+        last = items[-1][1]
+        if first is None or last is None or first == 0:
+            return None
+        return round((last - first) / first * 100.0, 3)
     except Exception:
-        pass
-    return None
+        return None
 
 def _compute_fundamentals_score_from_yf(symbol: str):
+    """
+    Lightweight score (0-100) from yfinance info (PE, PB, dividend). Returns integer 0-100 or None.
+    """
     if yf is None:
         return None
     try:
         t = yf.Ticker(symbol)
-        info = t.info if hasattr(t, "info") else {}
-        pe = info.get("trailingPE") or info.get("trailing_pe") or None
+        info = {}
+        try:
+            info = t.info if hasattr(t, "info") else {}
+        except Exception:
+            # some yfinance versions raise on info access
+            info = {}
+        pe = info.get("trailingPE") or info.get("trailing_pe") or info.get("peRatio") or None
         pb = info.get("priceToBook") or info.get("price_to_book") or None
         div = info.get("dividendYield") or info.get("dividend_yield") or None
         scores = []
-        if pe and pe > 0:
-            s = max(0.0, min(1.0, 1.0 / (pe / 15.0)))
+        if pe and isinstance(pe, (int, float)) and pe > 0:
+            s = max(0.0, min(1.0, 1.0 / (pe / 15.0)))  # PE around 15 = score ~1
             scores.append(s)
-        if pb and pb > 0:
+        if pb and isinstance(pb, (int, float)) and pb > 0:
             s = max(0.0, min(1.0, 1.0 - ((pb - 2.0) / 10.0)))
             scores.append(s)
-        if div and div > 0:
+        if div and isinstance(div, (int, float)) and div > 0:
             s = max(0.0, min(1.0, div * 5.0))
             scores.append(s)
         if not scores:
@@ -160,36 +260,69 @@ def _compute_fundamentals_score_from_yf(symbol: str):
         return None
 
 def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Public function used by main.py.
+    Tries IndianAPI first for price; always attempts to supply a 'history' dict (from yfinance) if possible.
+    """
     if not user_symbol or not str(user_symbol).strip():
         return None
     user_symbol = str(user_symbol).strip().upper()
     has_suffix = ("." in user_symbol) or (":" in user_symbol)
     tried_symbols = []
 
-    def _try_symbol_variants(fetcher):
+    def _try_variants(fetch_fn):
         to_try = [user_symbol] if has_suffix else [user_symbol + s for s in SUFFIX_TRIALS]
         for sym in to_try:
             if sym in tried_symbols:
                 continue
             tried_symbols.append(sym)
-            res = fetcher(sym)
+            try:
+                res = fetch_fn(sym)
+            except Exception:
+                res = None
             if res and res.get("current_price") is not None:
-                res["symbol"] = user_symbol
                 return res
         return None
 
-    # Try IndianAPI first
+    # Try IndianAPI first (for price)
     indian_res = None
     try:
-        indian_res = _try_symbol_variants(lambda s: _indianapi_fetch(s, api_key=indianapi_key))
+        indian_res = _try_variants(lambda s: _indianapi_fetch(s, api_key=indianapi_key))
     except Exception:
         indian_res = None
 
-    # Fallback to yfinance
-    yf_res = None
-    if indian_res is None:
+    # If indian_res exists but has no history, try to supplement with yfinance history
+    if indian_res:
+        # ensure resolved_symbol exists
+        resolved = indian_res.get("resolved_symbol") or user_symbol
+        y_hist = None
         try:
-            yf_res = _try_symbol_variants(lambda s: _yfinance_fetch(s))
+            # attempt to get history from yfinance for the resolved symbol
+            y_try = _yfinance_fetch(resolved)
+            if y_try and y_try.get("history"):
+                indian_res["history"] = y_try.get("history")
+        except Exception:
+            pass
+        # If still no history, try variants for yfinance (e.g., add .NS)
+        if not indian_res.get("history"):
+            # try symbol variants directly with yfinance
+            for sfx in SUFFIX_TRIALS:
+                sym2 = (user_symbol if has_suffix else user_symbol + sfx)
+                try:
+                    y2 = _yfinance_fetch(sym2)
+                    if y2 and y2.get("history"):
+                        indian_res["history"] = y2.get("history")
+                        # set resolved symbol to the one that returned history
+                        indian_res["resolved_symbol"] = sym2
+                        break
+                except Exception:
+                    continue
+
+    # If indian_res missing, fallback to yfinance
+    yf_res = None
+    if not indian_res:
+        try:
+            yf_res = _try_variants(lambda s: _yfinance_fetch(s))
         except Exception:
             yf_res = None
 
@@ -197,25 +330,28 @@ def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optiona
     if not chosen or chosen.get("current_price") is None:
         return None
 
+    resolved_symbol = chosen.get("resolved_symbol") or user_symbol
     history = chosen.get("history", None)
+
+    # compute momentum and fundamentals
     momentum = None
     fundamentals_score = None
-    resolved_symbol = chosen.get("resolved_symbol", None)
     try:
         if history:
             momentum = _compute_momentum_from_history(history)
     except Exception:
         momentum = None
     try:
-        if yf is not None and resolved_symbol:
-            fundamentals_score = _compute_fundamentals_score_from_yf(resolved_symbol)
+        # use yfinance info if possible
+        yf_sym = resolved_symbol
+        fundamentals_score = _compute_fundamentals_score_from_yf(yf_sym) if yf is not None else None
     except Exception:
         fundamentals_score = None
 
     result = {
         "symbol": user_symbol,
         "resolved_symbol": resolved_symbol,
-        "current_price": float(chosen.get("current_price")) if _safe_float(chosen.get("current_price")) is not None else None,
+        "current_price": _safe_float(chosen.get("current_price")),
         "provider": chosen.get("provider"),
         "timestamp": chosen.get("timestamp"),
         "raw": chosen.get("raw"),

@@ -1,7 +1,6 @@
-// frontend/src/components/Result.jsx
 import React from 'react'
 
-function Row({k, v}) {
+function Row({ k, v }) {
   return (
     <div className="row">
       <div className="label">{k}</div>
@@ -10,7 +9,7 @@ function Row({k, v}) {
   )
 }
 
-export default function Result({data}) {
+export default function Result({ data }) {
   if (!data) return <div className="card"><div className="empty">No result yet</div></div>
   if (data.raw && !data.current_price) {
     return <div className="card"><pre>{String(data.raw).slice(0,1000)}</pre></div>
@@ -26,12 +25,17 @@ export default function Result({data}) {
       <Row k="Confidence (%)" v={data.confidence_pct} />
       <Row k="Momentum (%)" v={data.momentum_pct} />
       <Row k="Fundamentals Score" v={data.fundamentals_score} />
-      <div style={{marginTop:10}}>
+      <div style={{ marginTop: 10 }}>
         <strong>Recommendation</strong>
         <div>Action: {data.recommendation?.action || 'NA'}</div>
         <div>Target: {data.recommendation?.target_price || 'NA'}</div>
         <div>{data.recommendation?.explanation || ''}</div>
       </div>
+      <div style={{ marginTop: 10, color: '#6b7280', fontSize: 12 }}>
+        <div>Model status: {data.model_status || 'NA'}</div>
+        <div>Prediction source: {data.prediction_source || 'NA'}</div>
+      </div>
     </div>
   )
 }
+

@@ -1,17 +1,13 @@
 # backend/providers.py
 """
-Providers with CSV fallback.
-
-Behavior:
- - IndianAPI for live price (if key provided).
- - Always attempt yfinance history for resolved symbol and common suffixes.
- - If yfinance has no history, try local CSV at backend/historical/<SYMBOL>.csv or <SYMBOL>.NS.csv.
- - Returns dict expected by modeling: symbol, resolved_symbol, current_price, provider, timestamp, raw, history, momentum_pct, fundamentals_score
+Providers that fetch history automatically from online sources (yfinance, Yahoo raw CSV, pandas_datareader/stooq).
+Fallback to local CSV only if all online sources fail.
 """
 
 import os
 import time
 import requests
+import io
 from typing import Optional, Dict, Any
 
 try:
@@ -24,6 +20,12 @@ try:
 except Exception:
     pd = None
 
+# pandas_datareader is optional but useful
+try:
+    from pandas_datareader import data as pdr
+except Exception:
+    pdr = None
+
 INDIANAPI_BASE = os.getenv("INDIANAPI_BASE", "https://stock.indianapi.in")
 INDIANAPI_KEY = os.getenv("INDIANAPI_KEY", None)
 RATE_LIMIT_CALLS_PER_MIN = int(os.getenv("RATE_LIMIT_CALLS_PER_MIN", "5"))
@@ -31,7 +33,7 @@ _LAST_CALL_FILE = ".indianapi_last_call"
 SUFFIX_TRIALS = ["", ".NS", ".BO"]
 HISTORICAL_DIR = os.path.join(os.path.dirname(__file__), "historical")  # backend/historical
 
-# helpers
+# ---- helpers ----
 def _safe_float(v):
     try:
         return float(v)
@@ -58,7 +60,7 @@ def _respect_rate_limit():
         except Exception:
             pass
 
-# IndianAPI price fetch
+# ---- IndianAPI ----
 def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 8) -> Optional[Dict[str, Any]]:
     key = api_key or INDIANAPI_KEY
     if not key:
@@ -97,7 +99,7 @@ def _indianapi_fetch(symbol: str, api_key: Optional[str] = None, timeout: int = 
     except Exception:
         return None
 
-# yfinance fetch and conversion
+# ---- yfinance ----
 def _convert_hist_df_to_dict(hist_df):
     try:
         d = {}
@@ -167,13 +169,70 @@ def _yfinance_fetch(symbol: str, period: str = "2y", max_rows: int = 2000) -> Op
     except Exception:
         return None
 
-# CSV fallback loader
+# ---- direct Yahoo CSV download (raw) ----
+def _yahoo_download_fetch(symbol: str, period_days: int = 365*2) -> Optional[Dict[str, Any]]:
+    """
+    Use Yahoo's CSV download endpoint as a fallback. Works for many tickers even
+    when yfinance wrapper fails.
+    """
+    if pd is None:
+        return None
+    try:
+        now = int(time.time())
+        p1 = now - int(period_days) * 86400
+        p2 = now
+        url = f"https://query1.finance.yahoo.com/v7/finance/download/{symbol}?period1={p1}&period2={p2}&interval=1d&events=history&includeAdjustedClose=true"
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        text = r.text
+        if not text or "Date" not in text:
+            return None
+        df = pd.read_csv(io.StringIO(text), parse_dates=["Date"])
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns={c:c.title() for c in df.columns})
+        if "Close" not in df.columns:
+            return None
+        if "Date" in df.columns:
+            df = df.set_index("Date")
+        hist_dict = _convert_hist_df_to_dict(df)
+        cp = None
+        try:
+            last_row = df.tail(1)
+            if "Close" in last_row.columns:
+                cp = _safe_float(list(last_row["Close"].values)[0])
+        except Exception:
+            cp = None
+        return {"resolved_symbol": symbol, "current_price": cp, "provider": "yahoo_csv", "timestamp": None, "raw": None, "history": hist_dict}
+    except Exception:
+        return None
+
+# ---- pandas_datareader (stooq) ----
+def _stooq_fetch(symbol: str, period_days: int = 365*2) -> Optional[Dict[str, Any]]:
+    if pdr is None or pd is None:
+        return None
+    try:
+        # stooq uses lowercase with exchange sometimes; try the symbol directly
+        df = pdr.DataReader(symbol, "stooq")
+        if df is None or df.empty:
+            return None
+        df = df.sort_index()
+        df = df.rename(columns={c:c.title() for c in df.columns})
+        hist_dict = _convert_hist_df_to_dict(df)
+        cp = None
+        try:
+            last_row = df.tail(1)
+            if "Close" in last_row.columns:
+                cp = _safe_float(list(last_row["Close"].values)[0])
+        except Exception:
+            cp = None
+        return {"resolved_symbol": symbol, "current_price": cp, "provider": "stooq", "timestamp": None, "raw": None, "history": hist_dict}
+    except Exception:
+        return None
+
+# ---- local CSV fallback (last resort) ----
 def _load_local_csv_history(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Look for backend/historical/<symbol>.csv (symbol may include .NS).
-    CSV format: Date,Open,High,Low,Close,Volume  (Date: YYYY-MM-DD)
-    Returns history dict like yfinance conversion or None
-    """
     if pd is None:
         return None
     try:
@@ -183,19 +242,15 @@ def _load_local_csv_history(symbol: str) -> Optional[Dict[str, Any]]:
         df = pd.read_csv(fname, parse_dates=["Date"])
         if df is None or df.empty:
             return None
-        # ensure expected columns present
-        cols = [c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]
         if "Close" not in df.columns:
             return None
-        # set index to Date
         if "Date" in df.columns:
             df = df.set_index("Date")
-        # convert to dict
         return _convert_hist_df_to_dict(df)
     except Exception:
         return None
 
-# simple analytics
+# ---- analytics ----
 def _compute_momentum_from_history(history_dict):
     try:
         if not history_dict or "Close" not in history_dict:
@@ -244,7 +299,7 @@ def _compute_fundamentals_score_from_yf(symbol: str):
     except Exception:
         return None
 
-# main public fetch
+# ---- main public function ----
 def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not user_symbol or not str(user_symbol).strip():
         return None
@@ -266,60 +321,181 @@ def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optiona
                 return res
         return None
 
-    # 1) indianapi (price) first
+    # 1) IndianAPI for current price
     indian_res = None
     try:
         indian_res = _try_variants(lambda s: _indianapi_fetch(s, api_key=indianapi_key))
     except Exception:
         indian_res = None
 
-    # 2) if indian_res found, try to add yfinance history
+    # 2) if indian_res found, attempt to supplement with history (many attempts)
     if indian_res:
         resolved = indian_res.get("resolved_symbol") or user_symbol
+
+        # (a) try yfinance
         try:
             y_try = _yfinance_fetch(resolved)
             if y_try and y_try.get("history"):
                 indian_res["history"] = y_try.get("history")
         except Exception:
             pass
+
+        # (b) try yahoo raw CSV
+        if not indian_res.get("history"):
+            try:
+                ycsv = _yahoo_download_fetch(resolved)
+                if ycsv and ycsv.get("history"):
+                    indian_res["history"] = ycsv.get("history")
+            except Exception:
+                pass
+
+        # (c) try stooq via pandas_datareader
+        if not indian_res.get("history"):
+            try:
+                st = _stooq_fetch(resolved)
+                if st and st.get("history"):
+                    indian_res["history"] = st.get("history")
+            except Exception:
+                pass
+
+        # (d) try resolved + .NS
         if not indian_res.get("history"):
             try:
                 if not resolved.endswith(".NS"):
-                    y_try_ns = _yfinance_fetch(resolved + ".NS")
-                    if y_try_ns and y_try_ns.get("history"):
-                        indian_res["history"] = y_try_ns.get("history")
+                    yns = _yfinance_fetch(resolved + ".NS")
+                    if yns and yns.get("history"):
+                        indian_res["history"] = yns.get("history")
                         indian_res["resolved_symbol"] = resolved + ".NS"
             except Exception:
                 pass
+
+        # (e) try variants user_symbol + suffixes
         if not indian_res.get("history"):
             for sfx in SUFFIX_TRIALS:
                 try:
                     candidate = (user_symbol if has_suffix else user_symbol + sfx)
-                    y_try2 = _yfinance_fetch(candidate)
-                    if y_try2 and y_try2.get("history"):
-                        indian_res["history"] = y_try2.get("history")
+                    y2 = _yfinance_fetch(candidate) or _yahoo_download_fetch(candidate) or _stooq_fetch(candidate)
+                    if y2 and y2.get("history"):
+                        indian_res["history"] = y2.get("history")
                         indian_res["resolved_symbol"] = candidate
                         break
                 except Exception:
                     continue
 
-    # 3) fallback to yfinance only if indian_res missing
+    # 3) If no indian_res, try yfinance / yahoo / stooq directly
     yf_res = None
     if not indian_res:
         try:
-            yf_res = _try_variants(lambda s: _yfinance_fetch(s))
+            # try combined approach across suffixes
+            for cand in ([user_symbol] if has_suffix else [user_symbol + s for s in SUFFIX_TRIALS]):
+                try:
+                    r = _yfinance_fetch(cand) or _yahoo_download_fetch(cand) or _stooq_fetch(cand)
+                    if r and r.get("current_price") is not None:
+                        yf_res = r
+                        break
+                except Exception:
+                    continue
         except Exception:
             yf_res = None
 
     chosen = indian_res or yf_res
 
-    # If chosen is missing or no current_price, try forced yfinance .NS for history and price
+    # 4) If chosen missing or no current_price, try forced yahoo .NS history; then CSV
     if not chosen or chosen.get("current_price") is None:
-        # try forcing .NS via yfinance
         forced_history = None
         forced_resolved = user_symbol
         try:
             if not user_symbol.endswith(".NS"):
-                forced = _yfinance_fetch(user_symbol + ".NS")
-                if fo
-::contentReference[oaicite:0]{index=0}
+                forced = _yahoo_download_fetch(user_symbol + ".NS") or _yfinance_fetch(user_symbol + ".NS") or _stooq_fetch(user_symbol + ".NS")
+                if forced and forced.get("history"):
+                    forced_history = forced.get("history")
+                    forced_resolved = user_symbol + ".NS"
+                    chosen = chosen or {}
+                    chosen["current_price"] = chosen.get("current_price") or forced.get("current_price")
+        except Exception:
+            forced_history = None
+
+        # local CSV fallback (only if online fails)
+        csv_history = None
+        csv_resolved = None
+        try:
+            for cand in [user_symbol, (user_symbol + ".NS")]:
+                csv = _load_local_csv_history(cand)
+                if csv:
+                    csv_history = csv
+                    csv_resolved = cand
+                    break
+        except Exception:
+            csv_history = None
+
+        if forced_history:
+            momentum = _compute_momentum_from_history(forced_history)
+            fundamentals = _compute_fundamentals_score_from_yf(forced_resolved) if yf is not None else None
+            return {
+                "symbol": user_symbol,
+                "resolved_symbol": forced_resolved,
+                "current_price": _safe_float(chosen.get("current_price")) if chosen else None,
+                "provider": "yahoo_csv",
+                "timestamp": None,
+                "raw": None,
+                "history": forced_history,
+                "momentum_pct": momentum,
+                "fundamentals_score": fundamentals,
+            }
+
+        if csv_history:
+            momentum = _compute_momentum_from_history(csv_history)
+            fundamentals = _compute_fundamentals_score_from_yf(csv_resolved) if yf is not None else None
+            return {
+                "symbol": user_symbol,
+                "resolved_symbol": csv_resolved,
+                "current_price": _safe_float(chosen.get("current_price")) if chosen else None,
+                "provider": "csv",
+                "timestamp": None,
+                "raw": None,
+                "history": csv_history,
+                "momentum_pct": momentum,
+                "fundamentals_score": fundamentals,
+            }
+        return None
+
+    # 5) Build final result and final CSV fallback if still no history
+    resolved_symbol = chosen.get("resolved_symbol") or user_symbol
+    history = chosen.get("history", None)
+
+    if not history:
+        try:
+            for cand in [resolved_symbol, resolved_symbol + ".NS", user_symbol, user_symbol + ".NS"]:
+                csv = _load_local_csv_history(cand)
+                if csv:
+                    history = csv
+                    resolved_symbol = cand
+                    chosen["provider"] = chosen.get("provider") or "csv"
+                    break
+        except Exception:
+            pass
+
+    momentum = None
+    fundamentals_score = None
+    try:
+        if history:
+            momentum = _compute_momentum_from_history(history)
+    except Exception:
+        momentum = None
+    try:
+        fundamentals_score = _compute_fundamentals_score_from_yf(resolved_symbol) if yf is not None else None
+    except Exception:
+        fundamentals_score = None
+
+    result = {
+        "symbol": user_symbol,
+        "resolved_symbol": resolved_symbol,
+        "current_price": _safe_float(chosen.get("current_price")),
+        "provider": chosen.get("provider"),
+        "timestamp": chosen.get("timestamp"),
+        "raw": chosen.get("raw"),
+        "history": history,
+        "momentum_pct": momentum,
+        "fundamentals_score": fundamentals_score,
+    }
+    return result

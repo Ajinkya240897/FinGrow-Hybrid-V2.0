@@ -8,8 +8,9 @@ HERE = os.path.dirname(__file__)
 MODELS_DIR = os.path.join(HERE, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-MIN_ROWS_FOR_TRAIN = int(os.getenv("MIN_ROWS_FOR_TRAIN", "60"))
-MIN_ROWS_FOR_FAST_TRAIN = int(os.getenv("MIN_ROWS_FOR_FAST_TRAIN", "30"))
+# More permissive defaults to reduce NA; keep env override
+MIN_ROWS_FOR_TRAIN = int(os.getenv("MIN_ROWS_FOR_TRAIN", "30"))
+MIN_ROWS_FOR_FAST_TRAIN = int(os.getenv("MIN_ROWS_FOR_FAST_TRAIN", "20"))
 MAX_ROWS_TO_USE = int(os.getenv("MAX_ROWS_TO_USE", "2000"))
 MODEL_TYPE = os.getenv("MODEL_TYPE", "ridge")  # 'ridge' or 'rf'
 
@@ -160,17 +161,23 @@ def _simple_momentum_fallback(history: Dict[str, Any], current_price: float) -> 
     try:
         if not history or "Close" not in history:
             return None, None, "No history for momentum fallback"
-        closes = list(history["Close"].values())
-        if len(closes) < 2:
+        closes_map = history["Close"]
+        if not closes_map:
+            return None, None, "No close points for momentum fallback"
+        items = sorted(closes_map.items(), key=lambda kv: kv[0])
+        if len(items) < 2:
             return None, None, "Not enough close points for momentum fallback"
-        s = pd.Series(closes).astype(float)
-        recent = s.tail(5)
+        # use very recent returns
+        recent = [v for (_,v) in items[-5:] if v is not None]
         if len(recent) < 2:
             return None, None, "Not enough recent points for momentum fallback"
-        rets = recent.pct_change(1).dropna()
-        if rets.empty:
+        rets = []
+        for i in range(1, len(recent)):
+            if recent[i-1] != 0:
+                rets.append((recent[i]-recent[i-1])/recent[i-1])
+        if not rets:
             return None, None, "Zero returns -> cannot estimate momentum"
-        mean_ret = float(rets.mean())
+        mean_ret = float(np.mean(rets))
         capped = max(min(mean_ret, 0.05), -0.05)
         pred = float(current_price) * (1.0 + capped)
         conf = min(50.0, 10.0 + len(recent) * 4.0)
@@ -179,10 +186,49 @@ def _simple_momentum_fallback(history: Dict[str, Any], current_price: float) -> 
         traceback.print_exc()
         return None, None, "Exception during momentum fallback"
 
+def _fundamentals_based_fallback(current_price: float, fundamentals_score: Optional[int], interval: str) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Conservative fallback when there is no history/model but we have current_price and fundamentals_score.
+    We map interval -> base expected return and scale by fundamentals_score (50 means neutral).
+    """
+    try:
+        if current_price is None:
+            return None, None, "No current_price for fundamentals fallback"
+        mapping = {"3-15d": 0.005, "1-3m": 0.02, "3-6m": 0.05, "1-3y": 0.18}
+        base = mapping.get(interval, 0.02)
+        # default fundamentals neutral at 50 -> scale factor 1.0
+        try:
+            fs = float(fundamentals_score) if fundamentals_score is not None else 50.0
+        except Exception:
+            fs = 50.0
+        # scale: each 10 points above 50 adds 10% to expected return
+        scale = 1.0 + ((fs - 50.0) / 100.0)
+        scale = max(0.5, min(scale, 1.8))  # limit scaling
+        pred = current_price * (1.0 + base * scale)
+        # low confidence for this heuristic; longer horizons slightly higher conf
+        conf = 10.0 + min(40.0, base * 100.0 * (1.0 + (fs-50.0)/50.0))
+        conf = round(max(5.0, min(conf, 60.0)), 2)
+        return round(pred, 4), conf, f"Fundamentals fallback (base={base}, fs={fs}, scale={scale:.3f})"
+    except Exception:
+        traceback.print_exc()
+        return None, None, "Exception in fundamentals fallback"
+
 def predict_with_model_or_fallback(model: Any, data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], bool, str]:
+    """
+    data must include:
+      - current_price (float)
+      - history (dict or None)
+      - fundamentals_score (optional)
+      - interval (optional) -> use heuristic if no model
+    Returns: (predicted_price, confidence_pct, used_fallback_bool, reason_str)
+    """
     try:
         cur = data.get("current_price", None)
         history = data.get("history", None)
+        interval = data.get("interval", None)
+        fundamentals_score = data.get("fundamentals_score", None)
+
+        # 1) If model exists, attempt to predict using latest features
         if model is not None:
             X = None
             if history:
@@ -195,7 +241,18 @@ def predict_with_model_or_fallback(model: Any, data: Dict[str, Any]) -> Tuple[Op
                     except Exception:
                         X = None
             if X is None and cur is not None:
-                X = np.array([[float(cur)]])
+                # try to craft a simple feature vector using current price proxies
+                try:
+                    X = np.zeros((1,7))
+                    X[0,0] = 0.0
+                    X[0,1] = 0.0
+                    X[0,2] = cur
+                    X[0,3] = cur
+                    X[0,4] = cur
+                    X[0,5] = 0.0
+                    X[0,6] = 50.0
+                except Exception:
+                    X = None
             if X is not None:
                 try:
                     preds = model.predict(X)
@@ -209,15 +266,29 @@ def predict_with_model_or_fallback(model: Any, data: Dict[str, Any]) -> Tuple[Op
                         else:
                             conf = 60.0
                     except Exception:
-                        conf = None
+                        conf = 50.0
                     return pred_value, conf, False, "Model-based prediction"
                 except Exception:
                     traceback.print_exc()
-        if cur is not None:
+
+        # 2) If we have history, try momentum fallback (short-term)
+        if history and cur is not None:
             pred, conf, reason = _simple_momentum_fallback(history, cur)
             if pred is not None:
                 return pred, conf, True, reason
-        return None, None, False, "No model and momentum fallback not possible"
+
+        # 3) If no history but we have fundamentals and current price, use fundamentals fallback
+        if cur is not None:
+            pred_fund, conf_fund, reason_fund = _fundamentals_based_fallback(cur, fundamentals_score, interval or "1-3m")
+            if pred_fund is not None:
+                return pred_fund, conf_fund, True, reason_fund
+
+        # 4) final generic fallback: tiny drift (very low confidence)
+        if cur is not None:
+            pred = cur * 1.01
+            return round(pred,4), 5.0, True, "Generic conservative fallback (1% drift)"
+
+        return None, None, False, "No model, no history, no cur price"
     except Exception:
         traceback.print_exc()
         return None, None, False, "Unexpected exception in predict_with_model_or_fallback"

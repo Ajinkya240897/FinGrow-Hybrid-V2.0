@@ -1,13 +1,8 @@
 const API_URL = import.meta.env.VITE_API_URL || 'https://fingrow-hybrid-v2-0.onrender.com'
 
 export async function predict(symbol, interval, indianApiKey){
-  const payload = {
-    symbol: String(symbol || '').trim().toUpperCase(),
-    interval: String(interval || '3-15d').trim()
-  }
-  if (indianApiKey && String(indianApiKey).trim() !== '') {
-    payload.indianapi_key = String(indianApiKey).trim()
-  }
+  const payload = { symbol: String(symbol || '').trim().toUpperCase(), interval: String(interval || '3-15d').trim() }
+  if (indianApiKey && String(indianApiKey).trim() !== '') payload.indianapi_key = String(indianApiKey).trim()
   const res = await fetch(`${API_URL}/model/predict`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

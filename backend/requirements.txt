@@ -7,3 +7,4 @@ scikit-learn
 joblib
 yfinance
 python-dateutil
+pandas_datareader

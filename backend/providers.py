@@ -1,6 +1,8 @@
 # backend/providers.py
 """
 Providers that fetch history automatically from online sources (yfinance, Yahoo raw CSV, pandas_datareader/stooq).
+Added: Always attempt to compute fundamentals_score from yfinance.info even if history missing,
+so UI displays Fundamentals Score instead of NA when possible.
 Fallback to local CSV only if all online sources fail.
 """
 
@@ -171,10 +173,6 @@ def _yfinance_fetch(symbol: str, period: str = "2y", max_rows: int = 2000) -> Op
 
 # ---- direct Yahoo CSV download (raw) ----
 def _yahoo_download_fetch(symbol: str, period_days: int = 365*2) -> Optional[Dict[str, Any]]:
-    """
-    Use Yahoo's CSV download endpoint as a fallback. Works for many tickers even
-    when yfinance wrapper fails.
-    """
     if pd is None:
         return None
     try:
@@ -213,7 +211,6 @@ def _stooq_fetch(symbol: str, period_days: int = 365*2) -> Optional[Dict[str, An
     if pdr is None or pd is None:
         return None
     try:
-        # stooq uses lowercase with exchange sometimes; try the symbol directly
         df = pdr.DataReader(symbol, "stooq")
         if df is None or df.empty:
             return None
@@ -250,25 +247,7 @@ def _load_local_csv_history(symbol: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-# ---- analytics ----
-def _compute_momentum_from_history(history_dict):
-    try:
-        if not history_dict or "Close" not in history_dict:
-            return None
-        closes_map = history_dict["Close"]
-        if not closes_map:
-            return None
-        items = sorted(closes_map.items(), key=lambda kv: kv[0])
-        if len(items) < 2:
-            return None
-        first = items[0][1]
-        last = items[-1][1]
-        if first is None or last is None or first == 0:
-            return None
-        return round((last - first) / first * 100.0, 3)
-    except Exception:
-        return None
-
+# ---- fundamentals scoring (always attempt if yfinance available) ----
 def _compute_fundamentals_score_from_yf(symbol: str):
     if yf is None:
         return None
@@ -279,6 +258,7 @@ def _compute_fundamentals_score_from_yf(symbol: str):
             info = t.info if hasattr(t, "info") else {}
         except Exception:
             info = {}
+        # simple heuristic using trailingPE, priceToBook, dividendYield
         pe = info.get("trailingPE") or info.get("trailing_pe") or info.get("peRatio") or None
         pb = info.get("priceToBook") or info.get("price_to_book") or None
         div = info.get("dividendYield") or info.get("dividend_yield") or None
@@ -296,6 +276,25 @@ def _compute_fundamentals_score_from_yf(symbol: str):
             return None
         avg = sum(scores) / len(scores)
         return int(round(avg * 100.0))
+    except Exception:
+        return None
+
+# ---- analytics for momentum ----
+def _compute_momentum_from_history(history_dict):
+    try:
+        if not history_dict or "Close" not in history_dict:
+            return None
+        closes_map = history_dict["Close"]
+        if not closes_map:
+            return None
+        items = sorted(closes_map.items(), key=lambda kv: kv[0])
+        if len(items) < 2:
+            return None
+        first = items[0][1]
+        last = items[-1][1]
+        if first is None or last is None or first == 0:
+            return None
+        return round((last - first) / first * 100.0, 3)
     except Exception:
         return None
 
@@ -386,7 +385,6 @@ def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optiona
     yf_res = None
     if not indian_res:
         try:
-            # try combined approach across suffixes
             for cand in ([user_symbol] if has_suffix else [user_symbol + s for s in SUFFIX_TRIALS]):
                 try:
                     r = _yfinance_fetch(cand) or _yahoo_download_fetch(cand) or _stooq_fetch(cand)
@@ -457,7 +455,33 @@ def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optiona
                 "momentum_pct": momentum,
                 "fundamentals_score": fundamentals,
             }
-        return None
+        # no history available at all
+        # but we still want to attempt to compute fundamentals_score using yfinance.info
+        fund_score = None
+        try:
+            # attempt multiple symbol variants to get info
+            for cand in ([user_symbol] if has_suffix else [user_symbol, user_symbol + ".NS", user_symbol + ".BO"]):
+                try:
+                    fs = _compute_fundamentals_score_from_yf(cand)
+                    if fs is not None:
+                        fund_score = fs
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            fund_score = None
+
+        return {
+            "symbol": user_symbol,
+            "resolved_symbol": chosen.get("resolved_symbol") if chosen else user_symbol,
+            "current_price": _safe_float(chosen.get("current_price")) if chosen else None,
+            "provider": chosen.get("provider") if chosen else "indianapi" if indian_res else "unknown",
+            "timestamp": None,
+            "raw": chosen.get("raw") if chosen else None,
+            "history": None,
+            "momentum_pct": None,
+            "fundamentals_score": fund_score,
+        }
 
     # 5) Build final result and final CSV fallback if still no history
     resolved_symbol = chosen.get("resolved_symbol") or user_symbol
@@ -483,7 +507,10 @@ def fetch_data(user_symbol: str, indianapi_key: Optional[str] = None) -> Optiona
     except Exception:
         momentum = None
     try:
+        # always attempt fundamentals info using resolved_symbol variants
         fundamentals_score = _compute_fundamentals_score_from_yf(resolved_symbol) if yf is not None else None
+        if fundamentals_score is None and not resolved_symbol.endswith(".NS"):
+            fundamentals_score = _compute_fundamentals_score_from_yf(resolved_symbol + ".NS") if yf is not None else None
     except Exception:
         fundamentals_score = None
 
